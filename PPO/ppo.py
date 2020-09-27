@@ -14,4 +14,4 @@ def get_config():
 
 class ActorCritic(keras.Model):
     def __init__(self) :
-        ac_layer1 = keras.layers.
+        ac_layer1 = keras.layers.Dense()
