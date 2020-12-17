@@ -8,7 +8,6 @@ from collections import deque
 from tensorflow._api.v2.data import Dataset
 from tensorflow.python.keras.backend_config import epsilon
 
-
 class get_config():
     max_len = 1e4
     iterations = 1e4
