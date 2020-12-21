@@ -5,3 +5,6 @@ __pycache__/
 
 # vscode config
 .vscode/
+
+# ipython
+.ipynb_checkpoints
