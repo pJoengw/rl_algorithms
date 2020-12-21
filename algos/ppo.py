@@ -1,229 +1,275 @@
 import os
 import gym
+import copy
+import imageio
+import datetime
 import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from collections import deque
-import os
-from tensorflow.python.types.core import Value
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.optimizers import Adam
 import tensorflow_probability as tfp
-
 tfd = tfp.distributions
 
+tf.keras.backend.set_floatx('float32')
 
-# Visualize 
-root_logdir = os.path.join(os.curdir, 'my_logs')
+# Visualize
+root_logdir = os.path.join(os.curdir, 'ppo_logs')
 def get_run_logdir():
     import time
     run_id = time.strftime("run_%Y_%m_%d-%H_%M_%S")
     return os.path.join(root_logdir, run_id)
 
-class get_config():
-    max_len = 1000
+def model(state_shape, action_dim, units=(400, 300, 100), discrete=False):
+    state = Input(shape=state_shape)
 
-    n_episodes = 300
-    n_fixed_steps = 2048
-    n_max_steps = 2048
-    batch_size = 2048
-    repeat_size = 6
+    vf = Dense(units[0], name="Value_L0", activation="tanh")(state)
+    for index in range(1, len(units)):
+        vf = Dense(units[index], name="Value_L{}".format(index), activation="tanh")(vf)
 
-    discount_factor = 0.995
-    ENV_NAME = 'Hopper-v2'
-    lamda = 0.97
-    epsilon = 0.2
+    value_pred = Dense(1, name="Out_value")(vf)
 
+    pi = Dense(units[0], name="Policy_L0", activation="tanh")(state)
+    for index in range(1, len(units)):
+        pi = Dense(units[index], name="Policy_L{}".format(index), activation="tanh")(pi)
 
-class ActorCritic(keras.Model):
-    def __init__(self, state_space, action_space,  bound, actor_union):
-        '''
-        # Arguments
-            state_space:    Type:int 状态空间的维度
-            action_space:   Type:int 动作空间的维度，不同场景可能会控制多个action
-            bound:          放大倍数
+    if discrete:
+        action_probs = Dense(action_dim, name="Out_probs", activation='softmax')(pi)
+        model = Model(inputs=state, outputs=[action_probs, value_pred])
+    else:
+        actions_mean = Dense(action_dim, name="Out_mean", activation='tanh')(pi)
+        model = Model(inputs=state, outputs=[actions_mean, value_pred])
 
-        '''
-        super().__init__()
-        self.state_space = state_space
-        self.action_space = action_space
-        self.bound = bound
+    return model
 
-        input_ = keras.layers.Input(shape=[self.state_space])
-        # Actor
-        ac_layer1 = keras.layers.Dense(64)(input_)
-        ac_layer2 = keras.layers.Dense(64)(ac_layer1)
-        ac_layer3 = keras.layers.Dense(
-            self.action_space, activation='tanh')(ac_layer2)
-        # tanh函数取值范围是[-1,1]，因此，需要放大bound倍，以适应action_space 的不同取值。
-        ac_mean = keras.layers.Lambda(lambda x: x * bound)(ac_layer3)
-        ac_logstd = keras.layers.Dense(
-            self.action_space)(ac_layer3)
+class PPO:
+    def __init__(
+            self,
+            env,
+            discrete=False,
+            lr=5e-4,
+            hidden_units=(24, 16),
+            c1=1.0,
+            c2=0.01,
+            clip_ratio=0.2,
+            gamma=0.95,
+            lam=1.0,
+            batch_size=64,
+            repeat_size=4,
+            writer = None
+    ):
+        self.env = env
+        self.state_shape = env.observation_space.shape  # shape of observations
+        self.action_dim = env.action_space.n if discrete else env.action_space.shape[0]  # number of actions
+        self.discrete = discrete
+        if not discrete:
+            self.action_bound = (env.action_space.high - env.action_space.low) / 2
+            self.action_shift = (env.action_space.high + env.action_space.low) / 2
 
-        # Critic
-        cr_layer1 = keras.layers.Dense(400, activation='tanh')(input_)
-        cr_layer2 = keras.layers.Dense(300, activation='tanh')(cr_layer1)
-        cr_layer3 = keras.layers.Dense(100, activation='tanh')(cr_layer2)
-        cr_outputs = keras.layers.Dense(1)(cr_layer3)
+        # Define and initialize network
+        self.policy = model(self.state_shape, self.action_dim, hidden_units, discrete=discrete)
+        self.model_optimizer = Adam(learning_rate=lr)
+        print(self.policy.summary())
 
-        self.actor = keras.Model(
-            inputs=[input_], outputs=[ac_mean, ac_logstd])
-        self.critic = keras.Model(inputs=[input_], outputs=[cr_outputs])
-        # self.critic = tf.Variable(shape=[self.state_space])
-    def call(self, state):
-        ac_mean, ac_logstd = self.actor(state)
-        value = self.critic(state)
-        return tf.squeeze(ac_mean), tf.squeeze(ac_logstd), tf.squeeze(value)
+        # Stdev for continuous action
+        if not discrete:
+            self.policy_log_std = tf.Variable(tf.zeros(self.action_dim, dtype=tf.float32), trainable=True)
 
-    def get_dist(self, mean, logstd):
-        std = tf.exp(logstd)
-        return tfd.Normal(loc=mean, scale=std)
+        # Set hyperparameters
+        self.gamma = gamma  # discount factor
+        self.lam = lam
+        self.c1 = c1  # value difference coeff
+        self.c2 = c2  # entropy coeff
+        self.clip_ratio = clip_ratio  # for clipped surrogate
+        self.batch_size = batch_size
+        self.repeat_size = repeat_size  # number of epochs per episode
 
-    @staticmethod
-    def _normal_logproba(action, mean, logstd, std=None):
-        if std is None:
-            std = tf.exp(logstd)
+        # Tensorboard
+        self.summaries = {}
+        self.writer = writer
 
-        std_sq = tf.math.pow(std, 2)
-        logproba = - 0.5 * \
-            tf.math.log(2 * np.math.pi) - logstd - \
-            tf.math.pow((action - mean), 2) / (2 * std_sq)
-        return tf.reduce_sum(logproba)
-
-    def _choose_action(self, mean, logstd, return_old_log=True):
-        std = tf.math.exp(logstd)
-        print("mean.shape = {}, logstd.shape = {}".format(mean.shape, logstd.shape))
-        action = tf.random.normal([self.action_space], mean, std, tf.float32)
-        log_probs = ActorCritic._normal_logproba(action, mean, logstd, std)
-        cliped_action = tf.clip_by_value(action, -1 * self.bound,  1 * self.bound)
-        if return_old_log:
-            return tf.squeeze(cliped_action), log_probs
+    def get_dist(self, output):
+        if self.discrete:
+            dist = tfd.Categorical(probs=output)
         else:
-            return tf.squeeze(cliped_action)
+            std = tf.math.exp(self.policy_log_std)
+            dist = tfd.Normal(loc=output, scale=std)
 
-def ppo(config, env):
+        return dist
 
-    # Hyper Params Setting
-    buffer = deque(maxlen=config.max_len)
-    n_episodes = config.n_episodes
-    n_fixed_steps = config.n_fixed_steps
-    n_max_steps = config.n_max_steps
+    def evaluate_actions(self, state, action):
+        output, value = self.policy(state)
+        dist = self.get_dist(output)
+        if not self.discrete:
+            action = (action - self.action_shift) / self.action_bound
 
-    discount_factor = config.discount_factor
-    lamda = config.lamda
-    epsilon = config.epsilon
+        log_probs = dist.log_prob(action)
+        if not self.discrete:
+            log_probs = tf.reduce_sum(log_probs, axis=-1)
 
-    # Define Network
-    ac_net = ActorCritic(env.observation_space.shape[0],env.action_space.shape[0], 1)
-    optimizer = keras.optimizers.Adam(learning_rate=4e-4)
+        entropy = dist.entropy()
 
-    # visual 
+        return log_probs, entropy, value
+
+    def act(self, state, test=False):
+        state = np.expand_dims(state, axis=0).astype(np.float32)
+        output, value = self.policy.predict(state)
+        dist = self.get_dist(output)
+
+        if self.discrete:
+            action = tf.math.argmax(output, axis=-1) if test else dist.sample()
+            log_probs = dist.log_prob(action)
+        else:
+            action = output if test else dist.sample()
+            action = tf.clip_by_value(action, -1, 1)
+            log_probs = tf.reduce_sum(dist.log_prob(action), axis=-1)
+            action = action * self.action_bound + self.action_shift
+
+        return action[0].numpy(), value[0][0], log_probs[0].numpy()
+
+    def save_model(self, fn):
+        self.policy.save(fn)
+
+    def load_model(self, fn):
+        self.policy.load_weights(fn)
+        print(self.policy.summary())
+
+    def get_gaes(self, rewards, v_preds, next_v_preds):
+        # source: https://github.com/uidilr/ppo_tf/blob/master/ppo.py#L98
+        deltas = [r_t + self.gamma * v_next - v for r_t, v_next, v in zip(rewards, next_v_preds, v_preds)]
+        gaes = copy.deepcopy(deltas)
+        for t in reversed(range(len(gaes) - 1)):  # is T-1, where T is time step which run policy
+            gaes[t] = gaes[t] + self.lam * self.gamma * gaes[t + 1]
+        return gaes
+
+    def learn(self, observations, actions, log_probs, next_v_preds, rewards, gaes):
+        rewards = tf.expand_dims(rewards, axis=-1)
+        rewards = tf.case(rewards, tf.float32)
+        next_v_preds = tf.expand_dims(next_v_preds, axis=-1)
+        next_v_preds = tf.case(next_v_preds, tf.float32)
+
+        with tf.GradientTape() as tape:
+            new_log_probs, entropy, state_values = self.evaluate_actions(observations, actions)
+
+            ratios = tf.exp(new_log_probs - log_probs)
+            clipped_ratios = tf.clip_by_value(ratios, clip_value_min=1-self.clip_ratio,
+                                            clip_value_max=1+self.clip_ratio)
+            loss_clip = tf.minimum(gaes * ratios, gaes * clipped_ratios)
+            loss_clip = tf.reduce_mean(loss_clip)
+
+            target_values = rewards + self.gamma * next_v_preds
+            vf_loss = tf.reduce_mean(tf.math.square(state_values - target_values))
+
+            entropy = tf.reduce_mean(entropy)
+            total_loss = -loss_clip + self.c1 * vf_loss - self.c2 * entropy
+
+        train_variables = self.policy.trainable_variables
+        if not self.discrete:
+            train_variables += [self.policy_log_std]
+        grad = tape.gradient(total_loss, train_variables)  # compute gradient
+        self.model_optimizer.apply_gradients(zip(grad, train_variables))
+
+        # tensorboard info
+        self.summaries['total_loss'] = total_loss
+        self.summaries['surr_loss'] = loss_clip
+        self.summaries['vf_loss'] = vf_loss
+        self.summaries['entropy'] = entropy
+
+    def train(self, max_epochs=8000, max_steps=500, save_freq=50):
+
+        episode, epoch = 0, 0
+
+        while epoch < max_epochs:
+            done, steps = False, 0
+            cur_state = self.env.reset()
+            obs, actions, log_probs, rewards, v_preds, next_v_preds = [], [], [], [], [], []
+
+            while not done and steps < max_steps:
+                action, value, log_prob = self.act(cur_state)  # determine action
+                next_state, reward, done, _ = self.env.step(action)  # act on env
+                # self.env.render(mode='rgb_array')
+
+                rewards.append(reward)
+                v_preds.append(value)
+                obs.append(cur_state)
+                actions.append(action)
+                log_probs.append(log_prob)
+
+                steps += 1
+                cur_state = next_state
+
+            next_v_preds = v_preds[1:] + [0]
+            gaes = self.get_gaes(rewards, v_preds, next_v_preds)
+            gaes = np.array(gaes).astype(dtype=np.float32)
+            gaes = (gaes - gaes.mean()) / gaes.std()
+            # Dataset
+            data = tf.data.Dataset.from_tensor_slices((obs, actions, log_probs, next_v_preds, rewards, gaes))
+            data = data.repeat(self.repeat_size).shuffle(3000).batch(self.batch_size).prefetch(1)
+            for batch_data in data:
+
+                # Train model
+                self.learn(*batch_data)
+                # Tensorboard update
+                with self.writer.as_default():
+                    tf.summary.scalar('Loss/total_loss', self.summaries['total_loss'], step=epoch)
+                    tf.summary.scalar('Loss/clipped_surr', self.summaries['surr_loss'], step=epoch)
+                    tf.summary.scalar('Loss/vf_loss', self.summaries['vf_loss'], step=epoch)
+                    tf.summary.scalar('Loss/entropy', self.summaries['entropy'], step=epoch)
+
+                self.writer.flush()
+                epoch += 1
+
+            episode += 1
+            print("episode {}: {} total reward, {} steps, {} epochs".format(
+                episode, np.sum(rewards), steps, epoch))
+
+            # Tensorboard update
+            with self.writer.as_default():
+                tf.summary.scalar('Main/episode_reward', np.sum(rewards), step=episode)
+                tf.summary.scalar('Main/episode_steps', steps, step=episode)
+
+            self.writer.flush()
+
+            if steps >= max_steps:
+                print("episode {}, reached max steps".format(episode))
+                self.save_model("../models/ppo/ppo_episode{}.h5".format(episode))
+
+            if episode % save_freq == 0:
+                self.save_model("../models/ppo/ppo_episode{}.h5".format(episode))
+
+        self.save_model("../models/ppo/ppo_final_episode{}.h5".format(episode))
+
+    def test(self, render=True, fps=30, filename='test_render.mp4'):
+        cur_state, done, rewards = self.env.reset(), False, 0
+        video = imageio.get_writer(filename, fps=fps)
+        while not done:
+            action, value, log_prob = self.act(cur_state, test=True)
+            next_state, reward, done, _ = self.env.step(action)
+            cur_state = next_state
+            rewards += reward
+            if render:
+                video.append_data(self.env.render(mode='rgb_array'))
+        video.close()
+        return rewards
+
+
+if __name__ == "__main__":
+
     loss_logdir = get_run_logdir()
     writer = tf.summary.create_file_writer(loss_logdir)
-    global_epoch = 0
 
-    for i_episode in range(n_episodes):
-
-        print("epoch: {}".format(i_episode))
-        num_steps = 0
-        rewards = 0.0
-        buffer.clear()
-
-        while num_steps < n_fixed_steps:
-            
-            state = env.reset()
-            state = np.expand_dims(state, axis=0).astype('float32')
-
-            # 收集数据
-            for t in range(n_max_steps):
-                ac_mean, ac_logstd, value = ac_net(state)
-                action, log_prob = ac_net._choose_action(ac_mean, ac_logstd)
-                action = action.numpy()
-                log_prob = log_prob.numpy()
-                next_state, reward, done, info = env.step(action)
-                next_state = next_state.reshape(1,-1).astype(np.float32)
-                reward = reward.astype(np.float32)
-                rewards += reward
-                mask = 0 if done else 1
-                buffer.append(
-                    [state, value, action, log_prob, mask, reward])
-
-                with writer.as_default():
-                    tf.summary.scalar('Main/reward', reward, step=i_episode * n_fixed_steps + num_steps)
-
-                state = next_state
-                if done:
-                    break
-                
-            
-            num_steps += (t +1)
-
-        all_states, all_values, all_actions, all_old_probs, all_masks, all_rewards = [
-            [buffer[i][var_index] for i in range(len(buffer))]
-            for var_index in range(6)
-        ]
-        all_states = np.squeeze(all_states)
-
-        # 计算 GAE
-        all_returns = np.zeros(shape=len(all_values), dtype=np.float32)
-        all_advantages = np.zeros(shape=len(all_values), dtype=np.float32)
-        all_deltas = np.zeros(shape=len(all_values), dtype=np.float32)
-
-        pre_return = 0
-        pre_value = 0
-        pre_advantage = 0
-        for i in reversed(range(len(buffer))):
-            all_returns[i] = all_rewards[i] + discount_factor * \
-                pre_return * all_masks[i]
-            all_deltas[i] = all_rewards[i] + discount_factor * \
-                pre_value * all_masks[i] - all_values[i]
-            all_advantages[i] = all_deltas[i] + discount_factor * \
-                lamda * pre_advantage * all_masks[i]
-
-            pre_return = all_returns[i]
-            pre_value = all_values[i]
-            pre_advantage = all_advantages[i]
-
-        dataset = tf.data.Dataset.from_tensor_slices((all_states,all_advantages, all_returns, all_actions, all_old_probs))
-        dataset = dataset.repeat(config.repeat_size).shuffle(3000).batch(config.batch_size)
+    gym_env = gym.make('Hopper-v2')
     
-        for index, batch_data in enumerate(dataset):
-            batch_states, batch_advantages, batch_rewards, batch_actions, batch_old_probs = batch_data
+    try:
+        assert ((gym_env.action_space.high == -gym_env.action_space.low).all())
+        is_discrete = False
+        print('Continuous Action Space')
+    except AttributeError:
+        is_discrete = True
+        print('Discrete Action Space')
 
-            with tf.GradientTape() as tape:
-                ac_mean, ac_logstd, cr_values = ac_net(batch_states)
-                ac_logproba = ActorCritic._normal_logproba(batch_actions, ac_mean, ac_logstd)
+    ppo = PPO(gym_env, discrete=is_discrete, writer=writer)
 
-                rio = tf.math.exp(tf.reduce_mean(ac_logproba - batch_old_probs))
-                cliped_rio = tf.clip_by_value(rio, 1-epsilon, 1+epsilon)
-
-                a_loss = tf.math.minimum(rio * tf.expand_dims(batch_advantages,1 ), cliped_rio * tf.expand_dims(batch_advantages,1))
-                ac_loss = -tf.reduce_mean(a_loss)
-                
-                c_loss = keras.losses.mean_squared_error(cr_values, batch_rewards)
-                cr_loss = tf.reduce_mean(c_loss)
-
-                all_loss = cr_loss + ac_loss
-            
-            global_epoch += 1
-            with writer.as_default():
-                tf.summary.scalar('Loss/rio', rio, step = global_epoch)
-
-                tf.summary.scalar('Loss/ac_loss', ac_loss, step=global_epoch)
-                tf.summary.scalar('Loss/cr_loss', cr_loss, step=global_epoch)
-                #tf.summary.scalar('Gradient/cr_loss', tape.gradient(cr_loss, cr_loss), step = global_epoch)
-            writer.flush()
-            
-            # Update Gradient
-            gradients = tape.gradient(all_loss, ac_net.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, ac_net.trainable_variables))
-        
-if __name__=='__main__':
-
-    config = get_config()
-
-    np.random.seed(42)
-    tf.random.set_seed(42)
-    env = gym.make(config.ENV_NAME)
-    env.seed(42)
-
-    ppo(config, env)
-    
+    ppo.train(max_epochs=1000, save_freq=50)
+    # reward = ppo.test()
+    # print("Total rewards: ", reward)
