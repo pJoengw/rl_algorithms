@@ -108,6 +108,7 @@ class PPO:
         if not discrete:
             self.dist = np.random.normal
 
+    @tf.function
     def evaluate_actions(self, state, action):
         mean, value = self.policy(state)
 
@@ -118,6 +119,7 @@ class PPO:
 
         return log_probs, value
 
+    @tf.function
     def _normal_logproba(self, x, mean, logstd, std=None):
         if std is None:
             std = tf.math.exp(logstd)
@@ -126,18 +128,20 @@ class PPO:
         logproba = - 0.5 * tf.math.log(2 * np.math.pi) - logstd - tf.math.pow((x - mean), 2) / (2 * std_sq)
         return tf.reduce_sum(logproba)
 
+    @tf.function
     def get_logproba(self, action_mean, actions):
 
         logproba = self._normal_logproba(actions, action_mean, self.policy_log_std)
         return logproba
 
+    @tf.function
     def act(self, state, test=False):
         
-        state = np.expand_dims(state, axis=0).astype(np.float32)
+        state = tf.cast(tf.expand_dims(state, axis=0),tf.float32)
 
         mean, value = self.policy(state)
 
-        std = np.exp(self.policy_log_std.numpy())
+        std = tf.exp(self.policy_log_std)
         
         action = mean if test else self.dist(loc=mean, scale=std)
         action = tf.constant(action, dtype=tf.float32)
@@ -153,6 +157,7 @@ class PPO:
         self.policy.load_weights(fn)
         print(self.policy.summary())
 
+    @tf.function
     def learn(self, all_states, all_advantages, all_rewards, all_actions, all_old_probs):
         all_rewards = tf.expand_dims(all_rewards, axis=-1)
         all_rewards = tf.cast(all_rewards, tf.float32)
@@ -185,6 +190,7 @@ class PPO:
         self.summaries['vf_loss'] = vf_loss
         self.summaries['entropy'] = entropy
 
+    @tf.function
     def train(self, num_episode=2000, max_steps=2000, save_freq=50):
 
         cnts = 0
@@ -202,9 +208,9 @@ class PPO:
                 reward_sum = 0
                 start_ = datetime.datetime.now()
                 for t in range(max_steps):
-                    start = datetime.datetime.now()
+                    #start = datetime.datetime.now()
                     action, value, log_prob = self.act(state) 
-                    print("动作耗时:{}".format(datetime.datetime.now()-start))
+                    #print("动作耗时:{}".format(datetime.datetime.now()-start))
                     next_state, reward, done, _ = self.env.step(action)
                     reward_sum += reward
                     mask = 0 if done else 1
